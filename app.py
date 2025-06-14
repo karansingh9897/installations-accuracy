@@ -1,17 +1,17 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
-import os
-import time
 import tempfile
 import requests
+import time
+import os
 
-# Initialize FastAPI app
-app = FastAPI(title="Vehicle Installation Analysis API", version="1.0.0")
+app = FastAPI(title="Vehicle Installation Analysis API", version="1.1.0")
 
 hf_token = "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"
 client = None
 
+# Initialize Gradio client on startup
 @app.on_event("startup")
 async def startup_event():
     global client
@@ -20,7 +20,7 @@ async def startup_event():
         client = Client("Qwen/Qwen2.5-VL-32B-Instruct", hf_token=hf_token)
         print("✅ Gradio client initialized successfully")
     except Exception as e:
-        print(f"❌ Error initializing Gradio client: {e}")
+        print(f"❌ Gradio client init error: {e}")
         client = None
 
 @app.get("/")
@@ -34,15 +34,16 @@ async def health_check():
         "client_status": "connected" if client else "disconnected"
     }
 
-# Accept list of image URLs
-class ImageURLs(BaseModel):
+# ✅ Define payload schema
+class ImagePromptRequest(BaseModel):
     image_urls: list[HttpUrl]
+    prompt: str
 
 @app.post("/analyze/")
-async def analyze_images(payload: ImageURLs):
+async def analyze_images_with_prompt(request: ImagePromptRequest):
     if not client:
         return JSONResponse(
-            content={"error": "Gradio client not initialized. Please check server logs."}, 
+            content={"error": "Gradio client not initialized."}, 
             status_code=500
         )
 
@@ -50,73 +51,57 @@ async def analyze_images(payload: ImageURLs):
     try:
         from gradio_client import handle_file
 
-        # Step 1: Download all images
-        for idx, url in enumerate(payload.image_urls):
+        history = []
+
+        # 1️⃣ Download and upload all images
+        for idx, url in enumerate(request.image_urls):
             response = requests.get(url)
             if response.status_code != 200:
                 return JSONResponse(
-                    content={"error": f"Failed to download image at index {idx}: {url}"}, 
+                    content={"error": f"Failed to download image at index {idx}: {url}"},
                     status_code=400
                 )
+
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
             temp_file.write(response.content)
             temp_file.close()
             temp_files.append(temp_file.name)
-            print(f"📥 Downloaded image from {url} to {temp_file.name}")
 
-        # Step 2: Upload all images to the model
-        history = []
-        for image_path in temp_files:
             history = client.predict(
                 history=history,
-                file=handle_file(image_path),
+                file=handle_file(temp_file.name),
                 api_name="/add_file"
             )
-            print(f"✅ Uploaded image {image_path}")
+            print(f"✅ Uploaded image {idx+1}/{len(request.image_urls)}")
+
+        # 2️⃣ Add user prompt
+        history = client.predict(
+            text=request.prompt,
+            api_name="/add_text"
+        )
+        print("✅ Prompt submitted")
 
         time.sleep(2)
 
-        # Step 3: Add the text prompt
-        prompt = ''' आपको एक ही वाहन की कई इमेज दी गई हैं, जो इंस्टॉलर द्वारा किए गए GPS डिवाइस इंस्टॉलेशन को दर्शाती हैं। इंस्टॉलर ने इंस्टॉलेशन पूरा करने के बाद डेटा अपलोड किया है, और अब आपको इसकी समीक्षा करनी है।
-
-        आपका कार्य निम्नलिखित है:
-
-        ✅ इंस्टॉलेशन सुधार बिंदु की सूची बनाएं जिसमें प्रत्येक बिंदु 5 शब्दों से अधिक न हो और उसके बाद "➡ Rating: X/10" के रूप में रेटिंग हो।
-
-        हर बिंदु एक नंबर से दर्शाएं (1️⃣, 2️⃣, 3️⃣ …)।
-        बिंदुओं जैसे "तार ढिले हैं – अच्छे से बांधो", "बहुत सारे तार बाहर हैं – टेप से लपेटो" आदि को शामिल करें।
-        कुल इंस्टॉलेशन की रेटिंग दें, उदाहरण के तौर पर: "🚀 कुल इंस्टॉलेशन रेटिंग: 3/10"।
-        अंत में एक छोटा प्रेरणादायक नोट दें, जैसे:
-        ➡ अधिक रुपये चाहिए? इंस्टॉलेशन सुधारो, फिर अधिक मिलेगा।
-        '''
-        history = client.predict(
-            text=prompt,
-            api_name="/add_text"
-        )
-        print("✅ Text prompt added")
-
-        time.sleep(3)
-
-        # Step 4: Get the model's response
+        # 3️⃣ Get model's final response
         result = client.predict(
             _chatbot=history,
             api_name="/predict"
         )
 
-        # Clean up downloaded images
         for path in temp_files:
-            os.unlink(path)
+            try: os.unlink(path)
+            except: pass
 
         if result and len(result) > 0:
-            model_response = result[-1][1]
             return JSONResponse(content={
                 "status": "success",
-                "analysis": model_response,
-                "image_count": len(payload.image_urls)
+                "image_count": len(request.image_urls),
+                "analysis": result[-1][1]
             })
         else:
             return JSONResponse(
-                content={"error": "No response received from the model"}, 
+                content={"error": "No response from model."}, 
                 status_code=500
             )
 
@@ -124,8 +109,7 @@ async def analyze_images(payload: ImageURLs):
         for path in temp_files:
             try: os.unlink(path)
             except: pass
-        print(f"❌ Error: {e}")
         return JSONResponse(
-            content={"error": f"An error occurred: {str(e)}"}, 
+            content={"error": f"Exception occurred: {str(e)}"},
             status_code=500
         )
