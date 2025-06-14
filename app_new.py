@@ -5,6 +5,7 @@ from gradio_client import Client, handle_file
 import os
 import time
 import json
+import re
 import traceback
 
 app = FastAPI()
@@ -18,7 +19,7 @@ client = Client("Qwen/Qwen2.5-VL-32B-Instruct", hf_token=hf_token)
 def generate_report(image_urls, prompt):
     """Helper function to generate vehicle installation report from Qwen API."""
     try:
-        # 1. Upload all images first
+        # Upload all images
         for image_url in image_urls:
             history_after_file = client.predict(
                 history=[], 
@@ -27,18 +28,19 @@ def generate_report(image_urls, prompt):
             )
         time.sleep(3)
 
-        # 2. Send prompt afterwards
+        # Send prompt
         history_after_prompt = client.predict(
             text=prompt,
             api_name="/add_text"
         )
         time.sleep(3)
 
-        # 3. Finally, generate the response
+        # Get final response
         result = client.predict(
             _chatbot=history_after_prompt,
             api_name="/predict"
         )
+
         print("Qwen API raw result:")
         print(result)
         
@@ -69,10 +71,13 @@ def generate_report_endpoint(data: ReportRequest):
     report = generate_report(images, prompt)
 
     try:
-        clean_json = report.split('
-json')[1].strip('`\n')
-
-        parsed = json.loads(clean_json)
-        return parsed
+        # Robust JSON block extraction using regex
+        match = re.search(r"\{.*\}", report, re.DOTALL)
+        if match:
+            clean_json = match.group()
+            parsed = json.loads(clean_json)
+            return parsed
+        else:
+            raise ValueError("JSON block not found in model output.")
     except Exception as e:
         raise HTTPException(500, f"Failed to parse Qwen's response: {str(e)}")
