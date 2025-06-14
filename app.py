@@ -1,115 +1,107 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 import tempfile
-import requests
-import time
+import aiohttp
 import os
+import time
+from typing import List
 
-app = FastAPI(title="Vehicle Installation Analysis API", version="1.1.0")
+from gradio_client import Client, handle_file
 
+# Initialize FastAPI
+app = FastAPI(title="Vehicle Installation Reviewer API", version="1.0")
+
+# Hugging Face token (replace if needed)
 hf_token = "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"
+
+# Load Gradio Client on startup
 client = None
 
-# Initialize Gradio client on startup
 @app.on_event("startup")
-async def startup_event():
+async def load_model():
     global client
     try:
-        from gradio_client import Client
         client = Client("Qwen/Qwen2.5-VL-32B-Instruct", hf_token=hf_token)
-        print("✅ Gradio client initialized successfully")
+        print("✅ Gradio client initialized.")
     except Exception as e:
-        print(f"❌ Gradio client init error: {e}")
+        print(f"❌ Failed to initialize client: {str(e)}")
         client = None
 
-@app.get("/")
-async def root():
-    return {"message": "Vehicle Installation Analysis API is running!"}
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy", 
-        "client_status": "connected" if client else "disconnected"
-    }
-
-# ✅ Define payload schema
-class ImagePromptRequest(BaseModel):
-    image_urls: list[HttpUrl]
+# Request body schema
+class AnalyzeRequest(BaseModel):
+    image_urls: List[str]
     prompt: str
 
+# Endpoint
 @app.post("/analyze/")
-async def analyze_images_with_prompt(request: ImagePromptRequest):
+async def analyze_images(request: AnalyzeRequest):
     if not client:
-        return JSONResponse(
-            content={"error": "Gradio client not initialized."}, 
-            status_code=500
-        )
+        raise HTTPException(status_code=500, detail="Gradio client not initialized")
 
     temp_files = []
     try:
-        from gradio_client import handle_file
+        print("📥 Downloading images...")
+        # Download all images
+        async with aiohttp.ClientSession() as session:
+            for url in request.image_urls:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        raise HTTPException(status_code=400, detail=f"Failed to download image: {url}")
+                    content = await response.read()
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                    temp_file.write(content)
+                    temp_file.close()
+                    temp_files.append(temp_file.name)
 
+        print("✅ Images downloaded and saved.")
+
+        # Upload images one by one
         history = []
-
-        # 1️⃣ Download and upload all images
-        for idx, url in enumerate(request.image_urls):
-            response = requests.get(url)
-            if response.status_code != 200:
-                return JSONResponse(
-                    content={"error": f"Failed to download image at index {idx}: {url}"},
-                    status_code=400
-                )
-
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            temp_file.write(response.content)
-            temp_file.close()
-            temp_files.append(temp_file.name)
-
+        for path in temp_files:
             history = client.predict(
                 history=history,
-                file=handle_file(temp_file.name),
+                file=handle_file(path),
                 api_name="/add_file"
             )
-            print(f"✅ Uploaded image {idx+1}/{len(request.image_urls)}")
+        print("✅ Images uploaded to model.")
 
-        # 2️⃣ Add user prompt
+        # Wait for model to process the images
+        time.sleep(2)
+
+        # Add the prompt
         history = client.predict(
             text=request.prompt,
             api_name="/add_text"
         )
-        print("✅ Prompt submitted")
+        print("✅ Prompt sent to model.")
 
         time.sleep(2)
 
-        # 3️⃣ Get model's final response
+        # Get the model output
         result = client.predict(
             _chatbot=history,
             api_name="/predict"
         )
+        print("✅ Received response from model.")
 
-        for path in temp_files:
-            try: os.unlink(path)
-            except: pass
-
-        if result and len(result) > 0:
+        # Parse final result
+        if result and isinstance(result, list):
+            final_response = result[-1][1]
             return JSONResponse(content={
                 "status": "success",
                 "image_count": len(request.image_urls),
-                "analysis": result[-1][1]
+                "analysis": final_response
             })
         else:
-            return JSONResponse(
-                content={"error": "No response from model."}, 
-                status_code=500
-            )
+            raise HTTPException(status_code=500, detail="Unexpected model output format.")
 
     except Exception as e:
+        print(f"❌ Exception occurred: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Exception occurred: {str(e)}")
+
+    finally:
+        # Clean up downloaded image files
         for path in temp_files:
-            try: os.unlink(path)
-            except: pass
-        return JSONResponse(
-            content={"error": f"Exception occurred: {str(e)}"},
-            status_code=500
-        )
+            if os.path.exists(path):
+                os.unlink(path)
