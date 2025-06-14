@@ -1,23 +1,22 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, HttpUrl
 import os
 import time
 import tempfile
+import requests
 
-# Initialize FastAPI app first
+# Initialize FastAPI app
 app = FastAPI(title="Vehicle Installation Analysis API", version="1.0.0")
 
-# Set your Hugging Face token
-hf_token = "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"  # Replace with your actual token
-
-# Initialize Gradio client after app creation
+hf_token = "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"
 client = None
 
 @app.on_event("startup")
 async def startup_event():
     global client
     try:
-        from gradio_client import Client, handle_file
+        from gradio_client import Client
         client = Client("Qwen/Qwen2.5-VL-32B-Instruct", hf_token=hf_token)
         print("✅ Gradio client initialized successfully")
     except Exception as e:
@@ -35,44 +34,49 @@ async def health_check():
         "client_status": "connected" if client else "disconnected"
     }
 
+# Accept list of image URLs
+class ImageURLs(BaseModel):
+    image_urls: list[HttpUrl]
+
 @app.post("/analyze/")
-async def analyze_image(file: UploadFile = File(...)):
+async def analyze_images(payload: ImageURLs):
     if not client:
         return JSONResponse(
             content={"error": "Gradio client not initialized. Please check server logs."}, 
             status_code=500
         )
-    
+
+    temp_files = []
     try:
         from gradio_client import handle_file
-        
-        # Validate file type
-        if not file.content_type.startswith('image/'):
-            return JSONResponse(
-                content={"error": "Please upload an image file"}, 
-                status_code=400
+
+        # Step 1: Download all images
+        for idx, url in enumerate(payload.image_urls):
+            response = requests.get(url)
+            if response.status_code != 200:
+                return JSONResponse(
+                    content={"error": f"Failed to download image at index {idx}: {url}"}, 
+                    status_code=400
+                )
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            temp_file.write(response.content)
+            temp_file.close()
+            temp_files.append(temp_file.name)
+            print(f"📥 Downloaded image from {url} to {temp_file.name}")
+
+        # Step 2: Upload all images to the model
+        history = []
+        for image_path in temp_files:
+            history = client.predict(
+                history=history,
+                file=handle_file(image_path),
+                api_name="/add_file"
             )
-        
-        # Create a temporary file to save the uploaded image
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file.filename}") as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            image_path = temp_file.name
+            print(f"✅ Uploaded image {image_path}")
 
-        print(f"📁 Image saved to: {image_path}")
+        time.sleep(2)
 
-        # Step 1: Upload the image
-        history_after_image = client.predict(
-            history=[],
-            file=handle_file(image_path),
-            api_name="/add_file"
-        )
-        print("✅ Image uploaded successfully")
-
-        # Add delay to ensure processing
-        time.sleep(3)
-
-        # Define your prompt
+        # Step 3: Add the text prompt
         prompt = ''' आपको एक ही वाहन की कई इमेज दी गई हैं, जो इंस्टॉलर द्वारा किए गए GPS डिवाइस इंस्टॉलेशन को दर्शाती हैं। इंस्टॉलर ने इंस्टॉलेशन पूरा करने के बाद डेटा अपलोड किया है, और अब आपको इसकी समीक्षा करनी है।
 
         आपका कार्य निम्नलिखित है:
@@ -85,35 +89,30 @@ async def analyze_image(file: UploadFile = File(...)):
         अंत में एक छोटा प्रेरणादायक नोट दें, जैसे:
         ➡ अधिक रुपये चाहिए? इंस्टॉलेशन सुधारो, फिर अधिक मिलेगा।
         '''
-
-        # Step 2: Add the text prompt
-        history_after_text = client.predict(
+        history = client.predict(
             text=prompt,
             api_name="/add_text"
         )
-        print("✅ Text prompt added successfully")
+        print("✅ Text prompt added")
 
-        # Add delay to ensure processing
         time.sleep(3)
 
-        # Step 3: Get the model's response
+        # Step 4: Get the model's response
         result = client.predict(
-            _chatbot=history_after_text,
+            _chatbot=history,
             api_name="/predict"
         )
-        print("✅ Model response generated")
 
-        # Clean up temporary file
-        os.unlink(image_path)
+        # Clean up downloaded images
+        for path in temp_files:
+            os.unlink(path)
 
-        # Extract the final response
         if result and len(result) > 0:
             model_response = result[-1][1]
             return JSONResponse(content={
                 "status": "success",
                 "analysis": model_response,
-                "filename": file.filename,
-                "file_size": len(content)
+                "image_count": len(payload.image_urls)
             })
         else:
             return JSONResponse(
@@ -122,19 +121,11 @@ async def analyze_image(file: UploadFile = File(...)):
             )
 
     except Exception as e:
-        # Clean up temporary file if it exists
-        if 'image_path' in locals():
-            try:
-                os.unlink(image_path)
-            except:
-                pass
-        
-        print(f"❌ Error in analyze_image: {str(e)}")
+        for path in temp_files:
+            try: os.unlink(path)
+            except: pass
+        print(f"❌ Error: {e}")
         return JSONResponse(
             content={"error": f"An error occurred: {str(e)}"}, 
             status_code=500
         )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
